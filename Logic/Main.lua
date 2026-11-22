@@ -6,6 +6,7 @@ local strfind = _G.strfind;
 local strlower = _G.strlower;
 local strmatch = _G.strmatch;
 local tinsert = _G.tinsert;
+local tremove = _G.tremove;
 local executeAfter = _G.C_Timer.After;
 local GetMouseFoci = _G.GetMouseFoci;
 local hooksecurefunc = _G.hooksecurefunc;
@@ -26,6 +27,7 @@ local Minimap = _G.Minimap;
 
 local LEFTBUTTON = 'LeftButton';
 local MIDDLEBUTTON = 'MiddleButton';
+local RIGHTBUTTON = 'RightButton';
 local ONMOUSEUP = 'OnMouseUp';
 
 local Layout = addon.importPending('Layouts/Main');
@@ -37,6 +39,11 @@ local mainButton;
 local logo;
 local collectedButtonMap = {};
 local collectedButtons = {};
+local hookedButtons = {};
+local originalStates = {};
+
+local frameMethods = _G.UIParent;
+local OVERRIDDEN_METHODS = {'ClearAllPoints', 'SetPoint', 'SetParent', 'SetScale'};
 
 --##############################################################################
 -- minimap button collecting
@@ -46,6 +53,11 @@ local function doNothing () end
 
 local function updateLayoutIfVisibilityChanged (frame)
   local visibility = frame:IsShown();
+
+  -- button might have been released after being hooked
+  if (collectedButtonMap[frame] == nil) then
+    return;
+  end
 
   if (collectedButtonMap[frame] ~= visibility) then
     collectedButtonMap[frame] = visibility;
@@ -70,7 +82,7 @@ local function isDescendant (parent, child)
 end
 
 local function checkButtonHover()
-  if (options ~= nil and options.autoClose == true) then
+  if (options ~= nil and options.autoClose == true and buttonContainer:IsShown()) then
     for x, frame in ipairs(GetMouseFoci()) do
       if (isDescendant(buttonContainer, frame) or isDescendant(mainButton, frame)) then
         return;
@@ -81,8 +93,33 @@ local function checkButtonHover()
   end
 end
 
+local function storeOriginalState (button)
+  local state = {
+    parent = button:GetParent(),
+    points = {},
+    strata = button:GetFrameStrata(),
+    scale = button:GetScale(),
+    ignoreParentScale = button:IsIgnoringParentScale(),
+    onDragStart = button:GetScript('OnDragStart'),
+    onDragStop = button:GetScript('OnDragStop'),
+    methods = {},
+  };
+
+  for x = 1, button:GetNumPoints() do
+    state.points[x] = {button:GetPoint(x)};
+  end
+
+  for _, method in ipairs(OVERRIDDEN_METHODS) do
+    state.methods[method] = rawget(button, method);
+  end
+
+  originalStates[button] = state;
+end
+
 local function collectButton (button)
   -- print('collecting button:', button:GetName());
+
+  storeOriginalState(button);
 
   button:SetParent(buttonContainer);
   button:SetFrameStrata(Constants.FRAME_STRATA);
@@ -94,7 +131,12 @@ local function collectButton (button)
   -- Hook the function on the frame itself instead of setting a script handler
   -- to execute only when the function is called and not when the frame changes
   -- visibility because the parent gets shown/hidden
-  if (type(button.Show) == "function" and type(button.Hide) == "function") then
+  -- hooks cannot be removed, so only apply them once per button
+  local alreadyHooked = hookedButtons[button];
+  hookedButtons[button] = true;
+
+  if (not alreadyHooked and
+      type(button.Show) == "function" and type(button.Hide) == "function") then
     hooksecurefunc(button, 'Show', updateLayoutIfVisibilityChanged);
     hooksecurefunc(button, 'Hide', updateLayoutIfVisibilityChanged);
   end
@@ -107,8 +149,12 @@ local function collectButton (button)
   button.SetParent = doNothing;
   button.SetScale = doNothing;
 
-  if (type(button.HookScript) == "function") then
-    button:HookScript('OnLeave', checkButtonHover);
+  if (not alreadyHooked and type(button.HookScript) == "function") then
+    button:HookScript('OnLeave', function (frame)
+      if (collectedButtonMap[frame] ~= nil) then
+        checkButtonHover();
+      end
+    end);
   end
 
   tinsert(collectedButtons, button);
@@ -117,6 +163,47 @@ end
 
 local function isButtonCollected (button)
   return (collectedButtonMap[button] ~= nil);
+end
+
+-- Gives a collected button back to wherever it was before being collected
+local function releaseButton (button)
+  if (not isButtonCollected(button)) then
+    return false;
+  end
+
+  for index, collected in ipairs(collectedButtons) do
+    if (collected == button) then
+      tremove(collectedButtons, index);
+      break;
+    end
+  end
+
+  collectedButtonMap[button] = nil;
+
+  local state = originalStates[button];
+  originalStates[button] = nil;
+
+  if (state ~= nil) then
+    for _, method in ipairs(OVERRIDDEN_METHODS) do
+      button[method] = state.methods[method];
+    end
+
+    frameMethods.SetParent(button, state.parent);
+    frameMethods.SetFrameStrata(button, state.strata);
+    button:SetIgnoreParentScale(state.ignoreParentScale);
+    frameMethods.SetScale(button, state.scale);
+    frameMethods.ClearAllPoints(button);
+
+    for _, point in ipairs(state.points) do
+      frameMethods.SetPoint(button, unpack(point));
+    end
+
+    button:SetScript('OnDragStart', state.onDragStart);
+    button:SetScript('OnDragStop', state.onDragStop);
+  end
+
+  Layout.updateLayout();
+  return true;
 end
 
 local function getLibDBIcon ()
@@ -242,7 +329,8 @@ local function collectWhitelistedButtons ()
   for buttonName in pairs(options.whitelist) do
     local button = getButtonByName(buttonName);
 
-    if (isValidFrame(button) and not isButtonCollected(button)) then
+    if (isValidFrame(button) and not isButtonCollected(button) and
+        not Blacklist.isButtonBlacklisted(button)) then
       collectButton(button);
     end
   end
@@ -422,6 +510,11 @@ local function initMainButton ()
       moveMainButton();
     elseif (button == LEFTBUTTON) then
       toggleButtons();
+    elseif (button == RIGHTBUTTON) then
+      local ButtonManager = addon.import('Features/ButtonManager');
+
+      collectMinimapButtonsAndUpdateLayout();
+      ButtonManager.toggle();
     end
   end);
 
@@ -474,7 +567,8 @@ end
 local function addDraggingTooltip ()
   Tooltip.createTooltip(mainButton, {
       'You can drag the button using the middle mouse button',
-      'or any mouse button while holding ALT.'
+      'or any mouse button while holding ALT.',
+      'Right-click to choose which buttons are collected.',
     });
 end
 
@@ -582,4 +676,7 @@ addon.export('Logic/Main', {
   searchButtonByName = searchButtonByName,
   getFoundButtonPaths = getFoundButtonPaths,
   isValidFrame = isValidFrame,
+  isButtonCollected = isButtonCollected,
+  releaseButton = releaseButton,
+  getButtonByName = getButtonByName,
 });
